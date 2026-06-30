@@ -105,6 +105,16 @@ unsigned long lastWifiOkAt = 0;
 unsigned long lastMqttOkAt = 0;
 unsigned long lastBleOkAt = 0;
 
+// Proactively re-establish MQTT on this interval. PubSubClient can go
+// "half-open" (isConnected() reports true but publishes silently fail, so HA
+// goes stale while the device looks healthy and self-heal stays blind). A
+// periodic clean disconnect/reconnect clears that before it becomes an outage.
+const unsigned long MQTT_REFRESH_MS = 900000;      // 15 min
+// Ultimate catch-all: a scheduled clean reboot bounds ANY undetectable stuck
+// state to at most this interval, even ones the watchdog/self-heal can't see.
+const unsigned long PROACTIVE_REBOOT_MS = 86400000;  // 24h
+unsigned long lastMqttRefreshAt = 0;
+
 // BLE client and characteristic pointers
 NimBLEClient* pClient = nullptr;
 NimBLERemoteCharacteristic* pWriteChar = nullptr;
@@ -466,10 +476,23 @@ bool connectToBLE() {
   return true;
 }
 
-void onRebootButtonCommand(HAButton* sender) {
-  Serial.println("Reboot requested from Home Assistant");
-  delay(200);  // let the MQTT ack flush
+// Restart with a clean network teardown. A bare ESP.restart() abandons the
+// MQTT socket without telling the broker, so the broker keeps the old session;
+// when the device reconnects (same client id) publishing breaks - that's why a
+// software reboot didn't recover a half-open state but a power cycle did. A
+// clean MQTT disconnect + WiFi/radio off makes a software restart behave like a
+// power cycle for the broker.
+void cleanRestart(const char* reason) {
+  Serial.printf("Restarting: %s\r\n", reason);
+  mqtt.disconnect();
+  delay(150);
+  WiFi.disconnect(true);
+  delay(250);
   ESP.restart();
+}
+
+void onRebootButtonCommand(HAButton* sender) {
+  cleanRestart("Home Assistant reboot button");
 }
 
 // Reboot if WiFi / MQTT / BLE stays down past its threshold. Each subsystem's
@@ -481,15 +504,28 @@ void selfHeal() {
   if (mqtt.isConnected()) lastMqttOkAt = now;
   if (bleConnected) lastBleOkAt = now;
 
+  // Ultimate catch-all: a scheduled clean reboot bounds ANY undetectable stuck
+  // state (including a half-open MQTT publish failure self-heal can't see).
+  if (now > PROACTIVE_REBOOT_MS) {
+    cleanRestart("scheduled 24h proactive reboot");
+  }
+
+  // Proactively refresh MQTT to clear half-open connections before they turn
+  // into a stale-HA outage. Clean disconnect; mqtt.loop() reconnects next iter
+  // (which also republishes discovery + current state to HA).
+  if (mqtt.isConnected() && now - lastMqttRefreshAt > MQTT_REFRESH_MS) {
+    lastMqttRefreshAt = now;
+    Serial.println("Proactive MQTT reconnect (clearing any half-open state)");
+    mqtt.disconnect();
+  }
+
   const char* reason = nullptr;
   if (now - lastWifiOkAt > WIFI_DOWN_REBOOT_MS) reason = "WiFi down too long";
   else if (now - lastMqttOkAt > MQTT_DOWN_REBOOT_MS) reason = "MQTT down too long";
   else if (now - lastBleOkAt > BLE_DOWN_REBOOT_MS) reason = "BLE down too long";
 
   if (reason != nullptr) {
-    Serial.printf("Self-heal: %s; restarting...\r\n", reason);
-    delay(200);
-    ESP.restart();
+    cleanRestart(reason);
   }
 }
 
@@ -515,7 +551,7 @@ void setup() {
   Serial.println("Connected to the network");
 
   device.setName("ChromaComfort BT to MQTT Bridge");
-  device.setSoftwareVersion("1.2.0");  // + hardware watchdog
+  device.setSoftwareVersion("1.3.0");  // + MQTT half-open recovery
 
   fan.onCommand(onSwitchCommandFan);
   fan.setName("Fan");
@@ -561,7 +597,7 @@ void setup() {
   connectToBLE();
 
   // Start the self-heal grace windows now so we don't reboot immediately at boot.
-  lastWifiOkAt = lastMqttOkAt = lastBleOkAt = millis();
+  lastWifiOkAt = lastMqttOkAt = lastBleOkAt = lastMqttRefreshAt = millis();
 
   // Hardware Task Watchdog (last-resort backstop). If loop() ever stops running
   // entirely - a total freeze the software self-heal can't catch, because the
