@@ -1,0 +1,14 @@
+# Private credentials - never commit
+config.h
+
+# Arduino / build artifacts
+build/
+*.bin
+*.elf
+*.hex
+*.map
+
+# Editor / OS cruft
+.vscode/
+.DS_Store
+Thumbs.db
