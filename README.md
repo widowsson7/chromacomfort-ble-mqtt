@@ -92,6 +92,36 @@ Everything below was derived from on-device GATT discovery and BLE sniffer
 captures (Nordic sniffer → Wireshark). Documented here so others don't have to
 re-derive it.
 
+### ⚠️ The non-obvious bits (read this first — they cost hours)
+
+If the fan connects fine but silently **ignores your commands**, it's almost
+certainly one of these. None of them is obvious from any single source:
+
+1. **Send every command 3× with a ~37 ms gap between writes.** The command
+   characteristic is *Write Without Response*, so there's no BLE-layer ack and
+   the fan drops lone writes. The official app sends each frame **three times,
+   ~37 ms apart** — and so must you. This is the single most obscure quirk in
+   the whole protocol; one or two writes is unreliable and looks like a totally
+   different bug.
+
+2. **The `version` byte must be `0x01`.** The first data byte is a protocol
+   version and the fan only honors commands with version **1**. Don't copy the
+   `0x05` that appears in the fan's *status replies* into your *commands* — it
+   gets silently ignored.
+
+3. **The `speed` byte must be `0` for normal commands.** Leave it `0`; only the
+   color-save command (`0x0D`) sets a non-zero speed (`30`). A stray speed value
+   changes behavior.
+
+4. **Write to the right characteristic.** The fan exposes a **decoy** service
+   with similar-looking UUIDs (`00001016-…`) whose writes do nothing. The real
+   command sink is `bb8a27e0-…` (handle `0x001d`) in the `a08f7710-…` service —
+   see the table below.
+
+5. **You must subscribe to notifications before commands work.** The fan won't
+   start processing commands until a client subscribes to the status
+   characteristic (i.e. the CCCD is written). Subscribe first, then send.
+
 ### GATT layout
 
 The fan exposes **two** custom services. Watch out:
@@ -125,14 +155,17 @@ write-without-response transport).
 |---|---|
 | `3A` | header (58) |
 | `11` | length (17 data bytes) |
-| `ver` | `0x01` |
+| `ver` | **must be `0x01`** — commands with any other version are silently ignored |
 | `c1`/`c2` | control bytes, `0x00` / `0x40` |
 | `type` | command code (below) |
 | `r g b` | RGB, **raw 0–255, no gamma** |
 | `dim` | brightness/dimmer, **0–100** |
-| `spd` | effect speed |
+| `spd` | effect speed — **keep `0`** for normal commands; only color-save (`0x0D`) uses `30` |
 | `sw1`/`sw2` | sweep color values (`0x01` / `0x18` defaults) |
 | rest | duration / timers / end (`0x00`) |
+
+> Commands are sent as **Write Without Response, repeated 3× with a ~37 ms gap**
+> — see gotcha #1 above. This is essential, not optional.
 
 ### Command type codes
 
