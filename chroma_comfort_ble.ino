@@ -66,7 +66,11 @@ uint8_t address[6] = FAN_MAC;
 
 WiFiClient client;
 HADevice device;
-HAMqtt mqtt(client, device);
+// 3rd arg = max device types (entities). We declare 10 below (fan, wallRgb,
+// light, whiteLight, 5 sensors, reboot); ArduinoHA's default cap can be lower,
+// which would silently drop the overflow and break their discovery. Size it
+// generously so every entity registers.
+HAMqtt mqtt(client, device, 15);
 int lastUpdateAt = 0;
 unsigned long lastBleAttemptAt = 0;  // for non-blocking BLE (re)connect timer
 int32_t acks = 0;
@@ -558,7 +562,7 @@ void setup() {
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
   device.setName("ChromaComfort BT to MQTT Bridge");
-  device.setSoftwareVersion("1.4.1");  // quiet logging + diagnostics
+  device.setSoftwareVersion("1.4.4");  // MQTT buffer 2KB (1KB still too small for RGB light discovery)
 
   fan.onCommand(onSwitchCommandFan);
   fan.setName("Fan");
@@ -591,8 +595,32 @@ void setup() {
   rebootButton.setIcon("mdi:restart");
   rebootButton.onCommand(onRebootButtonCommand);
 
+  // CRITICAL: PubSubClient's default MQTT buffer is only 256 bytes, and
+  // ArduinoHA never enlarges it. The RGB light's discovery (config) payload is
+  // 400-600+ bytes, so every discovery publish SILENTLY FAILS at the default
+  // size - the device connects and control works (HA->device needs no publish),
+  // but discovery/state never reach the broker, so HA never builds the entities.
+  // Enlarge the buffer so the biggest discovery message fits. The RGB light's
+  // config (rgb + brightness + state/command topics + device block) is the
+  // largest single message and exceeds 1024, so use 2048 for safe headroom.
+  // Symptom of too-small: the first entities' discovery lands but everything
+  // from the RGB light onward silently fails (publish > buffer returns false).
+  mqtt.setBufferSize(2048);
+
   mqtt.begin(BROKER_ADDR, MQTT_USER, MQTT_PASS);
   Serial.println("Connected to mqtt");
+
+  // Pump the MQTT client for a few seconds so it fully connects AND flushes its
+  // Home Assistant discovery (config) messages on a fresh, healthy connection -
+  // BEFORE the (potentially blocking) BLE connect below can starve loop() past
+  // the MQTT keepalive. Without this, discovery could get interrupted and HA
+  // would never build the entities. Watchdog isn't armed yet, so delay() is safe.
+  for (int i = 0; i < 30; i++) {
+    mqtt.loop();
+    delay(100);
+  }
+  Serial.printf("MQTT settled (connected=%d), discovery flushed\r\n",
+                mqtt.isConnected());
 
   NimBLEDevice::init("");
 
@@ -661,11 +689,11 @@ void loop() {
       byte m[6];
       WiFi.macAddress(m);
       Serial.printf(
-          "[diag] up=%lus ip=%s mac=%02X%02X%02X%02X%02X%02X wifi=%d mqtt=%d "
-          "ble=%d heap=%u\r\n",
+          "[diag] up=%lus ip=%s mac=%02X%02X%02X%02X%02X%02X rssi=%ddBm wifi=%d "
+          "mqtt=%d ble=%d heap=%u\r\n",
           uptimeValue, WiFi.localIP().toString().c_str(), m[0], m[1], m[2],
-          m[3], m[4], m[5], WiFi.status() == WL_CONNECTED, mqtt.isConnected(),
-          bleConnected, (unsigned)ESP.getFreeHeap());
+          m[3], m[4], m[5], (int)WiFi.RSSI(), WiFi.status() == WL_CONNECTED,
+          mqtt.isConnected(), bleConnected, (unsigned)ESP.getFreeHeap());
     }
   }
 
