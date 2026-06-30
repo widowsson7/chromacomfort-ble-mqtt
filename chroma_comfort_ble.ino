@@ -369,7 +369,6 @@ void onBLENotify(NimBLERemoteCharacteristic* pBLERemoteCharacteristic,
   }
 
   Packet packet = createPacket(pData[0], pData + 2, pData[1]);
-  printPacket(packet);
   rx.push(&packet);
 }
 
@@ -559,7 +558,7 @@ void setup() {
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
   device.setName("ChromaComfort BT to MQTT Bridge");
-  device.setSoftwareVersion("1.4.0");  // stable MAC-based unique id
+  device.setSoftwareVersion("1.4.1");  // quiet logging + diagnostics
 
   fan.onCommand(onSwitchCommandFan);
   fan.setName("Fan");
@@ -653,6 +652,21 @@ void loop() {
     }
     lastUpdateAt = millis();
     rxSensor.setValue(rxs);
+
+    // Periodic diagnostic heartbeat (every ~10s) so the serial always shows the
+    // identity + connection state regardless of BLE traffic.
+    static unsigned long lastDiag = 0;
+    if (millis() - lastDiag > 10000) {
+      lastDiag = millis();
+      byte m[6];
+      WiFi.macAddress(m);
+      Serial.printf(
+          "[diag] up=%lus ip=%s mac=%02X%02X%02X%02X%02X%02X wifi=%d mqtt=%d "
+          "ble=%d heap=%u\r\n",
+          uptimeValue, WiFi.localIP().toString().c_str(), m[0], m[1], m[2],
+          m[3], m[4], m[5], WiFi.status() == WL_CONNECTED, mqtt.isConnected(),
+          bleConnected, (unsigned)ESP.getFreeHeap());
+    }
   }
 
   if (!bleConnected) {
@@ -714,8 +728,6 @@ void loop() {
       StatusRxCmd* status = (StatusRxCmd*)(packet.data);
 
       if (status->control1 == 160 && status->control2 == 65) {
-        Serial.println("Status update...");
-
         byte s = status->status_mask;
         bool isFanOn = ((s >> 7) & 1) == 1;
         bool isLightOn = ((s >> 6) & 1) == 1;
@@ -727,10 +739,16 @@ void loop() {
         bool reservedBit = ((s >> 0) & 1) == 1;
         int brightness = status->brightness;
 
-        Serial.printf(
-            "Light: %d, Fan: %d, isFavoriteColor1Active: %d, wallRGBButton: "
-            "%d, Brightness: %d\r\n",
-            isLightOn, isFanOn, isFavoriteColor1Active, rgbButton, brightness);
+        // The fan re-sends identical status many times per second; only log it
+        // when something actually changes, so the serial stays readable.
+        static int lastStatusKey = -1;
+        int statusKey = ((int)s << 8) | (brightness & 0xFF);
+        if (statusKey != lastStatusKey) {
+          lastStatusKey = statusKey;
+          Serial.printf(
+              "Status: fan=%d white=%d color=%d wallRGB=%d bright=%d\r\n",
+              isFanOn, isLightOn, isFavoriteColor1Active, rgbButton, brightness);
+        }
 
         // The three light modes are mutually exclusive on the fan, so map each
         // status bit to its own entity. The single brightness byte belongs to
