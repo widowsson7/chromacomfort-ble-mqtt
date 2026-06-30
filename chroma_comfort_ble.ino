@@ -67,6 +67,7 @@ WiFiClient client;
 HADevice device;
 HAMqtt mqtt(client, device);
 int lastUpdateAt = 0;
+unsigned long lastBleAttemptAt = 0;  // for non-blocking BLE (re)connect timer
 int32_t acks = 0;
 int32_t txs = 0;
 int32_t rxs = 0;
@@ -381,11 +382,24 @@ bool connectToBLE() {
   pWriteChar = nullptr;
   pNotifyChar = nullptr;
 
+  // Delete any previous client (e.g. left over from a runtime disconnect) so we
+  // never leak clients and exhaust NimBLE's small client pool across reconnects.
+  if (pClient != nullptr) {
+    NimBLEDevice::deleteClient(pClient);
+    pClient = nullptr;
+  }
+
   pClient = NimBLEDevice::createClient();
   if (pClient == nullptr) {
     return bleFail("createClient() returned null (client pool exhausted)");
   }
-  pClient->setClientCallbacks(new BLEClientCallback(), false);
+  // One persistent callback instance (deleteCallbacks=false), so reconnecting
+  // doesn't leak a callback object each time.
+  static BLEClientCallback bleCallbacks;
+  pClient->setClientCallbacks(&bleCallbacks, false);
+  // Bound a failed attempt so an unreachable fan can't stall the main loop (and
+  // therefore MQTT) for NimBLE's default ~30s.
+  pClient->setConnectTimeout(10000);  // milliseconds
 
   if (!pClient->connect(bleAddress)) {
     return bleFail("Failed to connect to BLE device");
@@ -485,16 +499,13 @@ void setup() {
   Serial.println("Connected to mqtt");
 
   NimBLEDevice::init("");
-  Serial.println("Attempting to connect to BLE device");
 
-  bool connected = connectToBLE();
-  while (!connected) {
-    Serial.println("Failed to connect...trying again");
-    delay(1000);
-    connected = connectToBLE();
-  }
-
-  Serial.println("Connected to BLE");
+  // Attempt the first BLE connection, but DON'T block here if it fails. loop()
+  // retries on a timer, so MQTT / Home Assistant come up immediately even when
+  // the fan is unreachable at boot (the bridge just shows its entities and
+  // (re)connects to the fan in the background).
+  Serial.println("Attempting initial BLE connection (non-blocking)...");
+  connectToBLE();
 }
 
 int heartbeats_since_ack = 0;
@@ -513,9 +524,14 @@ void loop() {
   }
 
   if (!bleConnected) {
-    Serial.println("BLE disconnected, attempting reconnect...");
-    delay(1000);
-    connectToBLE();
+    // Non-blocking reconnect: retry on a timer instead of delay()-looping, so
+    // mqtt.loop() (called above every iteration) keeps Home Assistant alive
+    // while the fan is unreachable. Skip the TX/RX handling until BLE is back.
+    if (millis() - lastBleAttemptAt > 5000) {
+      lastBleAttemptAt = millis();
+      Serial.println("BLE not connected, attempting reconnect...");
+      connectToBLE();
+    }
     return;
   }
 
