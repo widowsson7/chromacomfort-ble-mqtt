@@ -533,10 +533,6 @@ void setup() {
   Serial.begin(115200);
   Serial.println("Starting...");
 
-  byte mac[6];
-  WiFi.macAddress(mac);
-  device.setUniqueId(mac, sizeof(mac));
-
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   unsigned long wifiStart = millis();
   while (WiFi.status() != WL_CONNECTED) {
@@ -550,8 +546,20 @@ void setup() {
   Serial.println();
   Serial.println("Connected to the network");
 
+  // Set the HA unique id / MQTT client id from the MAC. This MUST be read AFTER
+  // WiFi is initialized - reading it before WiFi.begin() returns uninitialized
+  // garbage, giving the device a random client id every boot. That caused
+  // broker session churn ("session taken over" / "exceeded timeout") and made
+  // the device look like a brand-new device to HA on every reboot, so its
+  // entities orphaned and froze.
+  byte mac[6];
+  WiFi.macAddress(mac);
+  device.setUniqueId(mac, sizeof(mac));
+  Serial.printf("Device unique id (MAC): %02X:%02X:%02X:%02X:%02X:%02X\r\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
   device.setName("ChromaComfort BT to MQTT Bridge");
-  device.setSoftwareVersion("1.3.0");  // + MQTT half-open recovery
+  device.setSoftwareVersion("1.4.0");  // stable MAC-based unique id
 
   fan.onCommand(onSwitchCommandFan);
   fan.setName("Fan");
