@@ -20,6 +20,7 @@
 #include <NimBLEDevice.h>
 #include <WiFi.h>
 #include <cppQueue.h>
+#include "esp_task_wdt.h"  // hardware Task Watchdog (ESP32 core 3.x API)
 
 // All user-specific config (WiFi, MQTT broker, fan MAC) lives in config.h.
 // Copy config.example.h to config.h and edit it. config.h is gitignored.
@@ -87,6 +88,22 @@ HASensorNumber errorSensor("errors");
 HASensorNumber txSensor("tx");
 HASensorNumber rxSensor("rx");
 HASensorNumber acksSensor("acks");
+HAButton rebootButton("reboot");  // remote reboot from the HA dashboard
+
+// Self-heal: reboot the ESP if a subsystem stays down past its threshold. This
+// recovers from wedged states (e.g. a hung BLE host stack) that in-loop
+// reconnect can't clear. Software ESP.restart() is used (not esp_task_wdt),
+// which is portable across ESP32 core versions.
+const unsigned long WIFI_DOWN_REBOOT_MS = 60000;   // 60s
+const unsigned long MQTT_DOWN_REBOOT_MS = 120000;  // 120s
+const unsigned long BLE_DOWN_REBOOT_MS = 90000;    // 90s (after ~18 retries)
+// Hardware Task Watchdog timeout. Must comfortably exceed the longest legit
+// loop() iteration (a BLE connect attempt can block ~10-30s), so set it well
+// above that - this only fires on a TRUE freeze where loop() stops entirely.
+const uint32_t WDT_TIMEOUT_MS = 60000;             // 60s
+unsigned long lastWifiOkAt = 0;
+unsigned long lastMqttOkAt = 0;
+unsigned long lastBleOkAt = 0;
 
 // BLE client and characteristic pointers
 NimBLEClient* pClient = nullptr;
@@ -449,6 +466,33 @@ bool connectToBLE() {
   return true;
 }
 
+void onRebootButtonCommand(HAButton* sender) {
+  Serial.println("Reboot requested from Home Assistant");
+  delay(200);  // let the MQTT ack flush
+  ESP.restart();
+}
+
+// Reboot if WiFi / MQTT / BLE stays down past its threshold. Each subsystem's
+// "last OK" timestamp is refreshed while it's healthy; if any falls too far
+// behind, restart. Covers hung states that in-loop reconnect can't recover.
+void selfHeal() {
+  unsigned long now = millis();
+  if (WiFi.status() == WL_CONNECTED) lastWifiOkAt = now;
+  if (mqtt.isConnected()) lastMqttOkAt = now;
+  if (bleConnected) lastBleOkAt = now;
+
+  const char* reason = nullptr;
+  if (now - lastWifiOkAt > WIFI_DOWN_REBOOT_MS) reason = "WiFi down too long";
+  else if (now - lastMqttOkAt > MQTT_DOWN_REBOOT_MS) reason = "MQTT down too long";
+  else if (now - lastBleOkAt > BLE_DOWN_REBOOT_MS) reason = "BLE down too long";
+
+  if (reason != nullptr) {
+    Serial.printf("Self-heal: %s; restarting...\r\n", reason);
+    delay(200);
+    ESP.restart();
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.println("Starting...");
@@ -458,15 +502,20 @@ void setup() {
   device.setUniqueId(mac, sizeof(mac));
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long wifiStart = millis();
   while (WiFi.status() != WL_CONNECTED) {
     Serial.print(".");
     delay(500);
+    if (millis() - wifiStart > WIFI_DOWN_REBOOT_MS) {
+      Serial.println("\nWiFi connect timed out; restarting...");
+      ESP.restart();
+    }
   }
   Serial.println();
   Serial.println("Connected to the network");
 
   device.setName("ChromaComfort BT to MQTT Bridge");
-  device.setSoftwareVersion("1.0.0");
+  device.setSoftwareVersion("1.2.0");  // + hardware watchdog
 
   fan.onCommand(onSwitchCommandFan);
   fan.setName("Fan");
@@ -495,6 +544,10 @@ void setup() {
   acksSensor.setIcon("mdi:call-received");
   acksSensor.setName("Acks");
 
+  rebootButton.setName("Reboot Bridge");
+  rebootButton.setIcon("mdi:restart");
+  rebootButton.onCommand(onRebootButtonCommand);
+
   mqtt.begin(BROKER_ADDR, MQTT_USER, MQTT_PASS);
   Serial.println("Connected to mqtt");
 
@@ -506,15 +559,36 @@ void setup() {
   // (re)connects to the fan in the background).
   Serial.println("Attempting initial BLE connection (non-blocking)...");
   connectToBLE();
+
+  // Start the self-heal grace windows now so we don't reboot immediately at boot.
+  lastWifiOkAt = lastMqttOkAt = lastBleOkAt = millis();
+
+  // Hardware Task Watchdog (last-resort backstop). If loop() ever stops running
+  // entirely - a total freeze the software self-heal can't catch, because the
+  // checking code is itself frozen - the silicon forces a chip reset after
+  // WDT_TIMEOUT_MS. The ESP32 core 3.x already inits the TWDT, so reconfigure it
+  // if init reports it's already running, then subscribe this (loop) task.
+  esp_task_wdt_config_t wdtConfig = {
+      .timeout_ms = WDT_TIMEOUT_MS,
+      .idle_core_mask = 0,
+      .trigger_panic = true,
+  };
+  if (esp_task_wdt_init(&wdtConfig) == ESP_ERR_INVALID_STATE) {
+    esp_task_wdt_reconfigure(&wdtConfig);
+  }
+  esp_task_wdt_add(NULL);
+  Serial.printf("Hardware watchdog armed (%lu ms)\r\n", (unsigned long)WDT_TIMEOUT_MS);
 }
 
 int heartbeats_since_ack = 0;
 bool firstRun = true;
 
 void loop() {
+  esp_task_wdt_reset();  // pet the hardware watchdog every iteration
   mqtt.loop();
+  selfHeal();
 
-  if (!firstRun) {
+  if (firstRun) {
     acksSensor.setValue((int32_t)0);
     rxSensor.setValue((int32_t)0);
     txSensor.setValue((int32_t)0);
@@ -523,18 +597,9 @@ void loop() {
     firstRun = false;
   }
 
-  if (!bleConnected) {
-    // Non-blocking reconnect: retry on a timer instead of delay()-looping, so
-    // mqtt.loop() (called above every iteration) keeps Home Assistant alive
-    // while the fan is unreachable. Skip the TX/RX handling until BLE is back.
-    if (millis() - lastBleAttemptAt > 5000) {
-      lastBleAttemptAt = millis();
-      Serial.println("BLE not connected, attempting reconnect...");
-      connectToBLE();
-    }
-    return;
-  }
-
+  // Telemetry updates every 2s regardless of BLE state, so uptime keeps climbing
+  // even while the fan is unreachable. A frozen uptime then unambiguously means
+  // the chip itself is dead (vs. just a dropped BLE link).
   if ((millis() - lastUpdateAt) > 2000) {
     unsigned long uptimeValue = millis() / 1000;
     uptimeSensor.setValue((int32_t)uptimeValue);
@@ -544,6 +609,19 @@ void loop() {
     }
     lastUpdateAt = millis();
     rxSensor.setValue(rxs);
+  }
+
+  if (!bleConnected) {
+    // Non-blocking reconnect: retry on a timer instead of delay()-looping, so
+    // mqtt.loop() (called above every iteration) keeps Home Assistant alive
+    // while the fan is unreachable. selfHeal() reboots if BLE stays down too
+    // long. Skip the TX/RX handling until BLE is back.
+    if (millis() - lastBleAttemptAt > 5000) {
+      lastBleAttemptAt = millis();
+      Serial.println("BLE not connected, attempting reconnect...");
+      connectToBLE();
+    }
+    return;
   }
 
   if (tx.getCount() > 0) {
