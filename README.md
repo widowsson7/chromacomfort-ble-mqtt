@@ -27,7 +27,14 @@ Exposed in Home Assistant as one MQTT device with these entities:
 | **White Light** | light (dimmable) | The bright white light (1st wall switch) |
 | **Color Light** | light (dimmable + RGB) | Custom RGB color ("favorite color") |
 | **Wall RGB** | switch | The factory color-cycle mode (2nd wall switch) |
-| Uptime / TX / RX / Acks / Errors | sensors | Diagnostics |
+| Uptime / TX / RX / Acks / Errors / WiFi RSSI | sensors | Diagnostics |
+| **Last Restart Reason** | sensor | Why the previous boot ended (one-shot: saved by soft restarts, cleared once read; hard resets report the silicon's `esp_reset_reason` code instead) |
+| **Reboot Bridge** | button | Clean remote restart from the HA dashboard |
+
+The **Acks** sensor counts *commands* that received an `A0 40` ack frame from
+the fan, not raw ack frames (the fan may ack each of the three writes in a
+burst). Before v1.5.1 the ack-matching logic was gated on a queue state that
+was never true by the time the ack arrived, so the counter sat at zero forever.
 
 The fan's light has **three mutually-exclusive modes** — White, Color, and the
 Wall-RGB cycle. Turning one on turns the others off; the firmware reflects this
@@ -51,9 +58,33 @@ Install via the Arduino IDE Library Manager / Boards Manager:
 - **[NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino) 2.x** (developed on 2.5.0)
 - **[ArduinoHA](https://github.com/dawidchyrzynski/arduino-home-assistant)** (home-assistant-integration)
 - **[cppQueue](https://github.com/SMFSW/Queue)** (Library Manager name: "Queue")
+- **ArduinoOTA** — bundled with the ESP32 core, no separate install needed.
 
 > NimBLE is required (not the legacy Bluedroid `BLEDevice.h`). See
 > [Why NimBLE](#why-nimble) below.
+
+### Build options (`build_opt.h`, `CC_DEBUG`)
+
+`build_opt.h` in the sketch folder is **not** a header — the ESP32 Arduino
+core (3.x) feeds it to gcc as a response file of extra compile flags, applied
+to every compilation unit (sketch and libraries) in both the IDE and
+arduino-cli builds. **Comments are not allowed in it** (gcc would parse them
+as file arguments); flags only, one per line. Don't delete it: it currently
+compiles out the three NimBLE roles this sketch never uses (peripheral,
+broadcaster, observer — it's a pure central that connects by fixed MAC and
+never scans or advertises), which saves ~17 KB of flash (measured: 1,250,695
+→ 1,233,531 bytes).
+
+Serial diagnostics are compiled in by default (`CC_DEBUG` defaults to `1` in
+the sketch). Adding `-DCC_DEBUG=0` to `build_opt.h` strips every log string
+and printf from flash (measured saving: 3,776 bytes) — flip it only if you
+need the headroom, since it makes USB serial debugging blind.
+
+If flash headroom ever becomes a real problem, the big lever isn't the
+binary, it's the partition scheme: *Tools > Partition Scheme > Minimal SPIFFS
+(1.9MB APP with OTA)* (CLI: `--fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs`)
+raises the app slot from 1,310,720 to 1,966,080 bytes and keeps OTA. The
+partition table itself can't be changed over OTA — that one flash must be USB.
 
 ## Setup & flashing
 
@@ -66,16 +97,25 @@ Install via the Arduino IDE Library Manager / Boards Manager:
    `config.h` is gitignored, so your credentials are never committed.
 
 2. **Select the board** in Arduino IDE (e.g. *DOIT ESP32 DEVKIT V1*) and the
-   correct serial port.
+   correct serial port. **Partition scheme must reserve room for OTA** (Tools >
+   Partition Scheme) — most default schemes do; a "Huge APP" single-partition
+   scheme does not and will make OTA uploads fail.
 
-3. **Upload.** If the upload fails with `Wrong boot mode detected (0x13)`, hold
-   the **BOOT** button on the ESP32 down through the entire "Connecting…" phase
-   and release it once flashing starts. (Some boards don't auto-reset into the
-   bootloader.)
+3. **Upload over USB.** If the upload fails with `Wrong boot mode detected
+   (0x13)`, hold the **BOOT** button on the ESP32 down through the entire
+   "Connecting…" phase and release it once flashing starts. (Some boards don't
+   auto-reset into the bootloader.)
 
 4. The device appears in Home Assistant automatically via MQTT discovery. If you
    add/rename entities later and they don't show up, power-cycle the ESP32 —
    ArduinoHA only republishes discovery on a fresh MQTT connection.
+
+5. **After this first flash, updates can go out wirelessly.** Once the board
+   boots with this firmware, it shows up as a network port in the Arduino IDE
+   (Tools > Port > "chromacomfort-bridge at `<ip>`") or via
+   `arduino-cli upload -p <ip> --board <fqbn>` with `OTA_PASSWORD` from
+   `config.h` when prompted. No more BOOT-button dance for future firmware
+   changes — only the initial move to an OTA-capable partition scheme needs USB.
 
 ## How it works
 
@@ -121,6 +161,25 @@ certainly one of these. None of them is obvious from any single source:
 5. **You must subscribe to notifications before commands work.** The fan won't
    start processing commands until a client subscribes to the status
    characteristic (i.e. the CCCD is written). Subscribe first, then send.
+
+6. **This isn't BLE, but it'll cost you the same way: ArduinoHA's entity
+   unique_ids are bare (`"fan"`, `"uptime"`, etc.) unless you call
+   `device.enableExtendedUniqueIds()`.** Without it, ANY device that ever
+   publishes MQTT discovery under those same bare ids — a stale identity from
+   before the v1.4.0 MAC fix, a factory-reset test board, anything — silently
+   shadows your real device's entities in Home Assistant. This happened for
+   real: a leftover pre-fix identity (`0000d3120f80`) owned the fan/light/
+   uptime/etc. entities in HA while the live device (a different, correct MAC)
+   only owned entities added later, and every command sent to "the fan" from
+   HA was actually hitting nothing. `enableExtendedUniqueIds()` (added in
+   v1.5.0) namespaces every entity by the device's own MAC, making this class
+   of collision structurally impossible instead of something you have to
+   notice and clean up by hand. **One-time consequence when you flip this on:**
+   Home Assistant will see it as a set of brand-new entities (different
+   unique_id → not recognized as the existing ones), so the current device's
+   entities need to be removed from HA's registry once, right after flashing,
+   so the fresh discovery reclaims the same plain entity_ids instead of
+   getting a `_2` suffix.
 
 ### GATT layout
 

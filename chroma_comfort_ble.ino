@@ -17,14 +17,33 @@
 
 #include <Arduino.h>
 #include <ArduinoHA.h>
+#include <ArduinoOTA.h>    // wireless firmware updates over WiFi
 #include <NimBLEDevice.h>
 #include <WiFi.h>
 #include <cppQueue.h>
 #include "esp_task_wdt.h"  // hardware Task Watchdog (ESP32 core 3.x API)
+#include "esp_system.h"    // esp_reset_reason() for unlogged-reset forensics
+#include <Preferences.h>   // persist crash diagnostics across a self-heal restart
 
 // All user-specific config (WiFi, MQTT broker, fan MAC) lives in config.h.
 // Copy config.example.h to config.h and edit it. config.h is gitignored.
 #include "config.h"
+
+// Serial diagnostics. Set CC_DEBUG to 0 (or add -DCC_DEBUG=0 to build_opt.h)
+// to compile out every log string and printf call, freeing flash. Default is
+// on, matching the historical behavior.
+#ifndef CC_DEBUG
+#define CC_DEBUG 1
+#endif
+#if CC_DEBUG
+#define DBG_PRINT(...) Serial.print(__VA_ARGS__)
+#define DBG_PRINTLN(...) Serial.println(__VA_ARGS__)
+#define DBG_PRINTF(...) Serial.printf(__VA_ARGS__)
+#else
+#define DBG_PRINT(...)
+#define DBG_PRINTLN(...)
+#define DBG_PRINTF(...)
+#endif
 
 // Fan BLE MAC address (defined as FAN_MAC in config.h).
 uint8_t address[6] = FAN_MAC;
@@ -66,12 +85,14 @@ uint8_t address[6] = FAN_MAC;
 
 WiFiClient client;
 HADevice device;
-// 3rd arg = max device types (entities). We declare 10 below (fan, wallRgb,
-// light, whiteLight, 5 sensors, reboot); ArduinoHA's default cap can be lower,
+// 3rd arg = max device types (entities). We declare 12 below (fan, wallRgb,
+// light, whiteLight, 7 sensors, reboot); ArduinoHA's default cap can be lower,
 // which would silently drop the overflow and break their discovery. Size it
 // generously so every entity registers.
 HAMqtt mqtt(client, device, 15);
-int lastUpdateAt = 0;
+Preferences crashPrefs;
+String lastRestartInfo = "none";
+unsigned long lastUpdateAt = 0;
 unsigned long lastBleAttemptAt = 0;  // for non-blocking BLE (re)connect timer
 int32_t acks = 0;
 int32_t txs = 0;
@@ -92,6 +113,8 @@ HASensorNumber errorSensor("errors");
 HASensorNumber txSensor("tx");
 HASensorNumber rxSensor("rx");
 HASensorNumber acksSensor("acks");
+HASensorNumber rssiSensor("rssi");
+HASensor lastRestartSensor("lastrestart");
 HAButton rebootButton("reboot");  // remote reboot from the HA dashboard
 
 // Self-heal: reboot the ESP if a subsystem stays down past its threshold. This
@@ -109,15 +132,12 @@ unsigned long lastWifiOkAt = 0;
 unsigned long lastMqttOkAt = 0;
 unsigned long lastBleOkAt = 0;
 
-// Proactively re-establish MQTT on this interval. PubSubClient can go
-// "half-open" (isConnected() reports true but publishes silently fail, so HA
-// goes stale while the device looks healthy and self-heal stays blind). A
-// periodic clean disconnect/reconnect clears that before it becomes an outage.
-const unsigned long MQTT_REFRESH_MS = 900000;      // 15 min
 // Ultimate catch-all: a scheduled clean reboot bounds ANY undetectable stuck
 // state to at most this interval, even ones the watchdog/self-heal can't see.
+// (HA also now triggers a clean reboot every 6h on a wall-clock schedule via
+// the "Bathroom Fan - Bridge Scheduled Reboot" automation; this is a backstop
+// in case that automation or MQTT itself is what's down.)
 const unsigned long PROACTIVE_REBOOT_MS = 86400000;  // 24h
-unsigned long lastMqttRefreshAt = 0;
 
 // BLE client and characteristic pointers
 NimBLEClient* pClient = nullptr;
@@ -125,13 +145,13 @@ NimBLERemoteCharacteristic* pWriteChar = nullptr;
 NimBLERemoteCharacteristic* pNotifyChar = nullptr;
 bool bleConnected = false;
 
-typedef struct Packet {
+struct Packet {
   byte header;
   byte len;
   uint8_t data[CODE_CMD_LENGTH];
 };
 
-typedef struct TxCmd {
+struct TxCmd {
   byte version = CODE_VERSION;
   byte ctrl_cmd_1 = CODE_CTRL_CMD_1;
   byte ctrl_cmd_2 = CODE_CTRL_CMD_2;
@@ -151,7 +171,7 @@ typedef struct TxCmd {
   byte data_end = 0;
 };
 
-typedef struct StatusRxCmd {
+struct StatusRxCmd {
   byte version = 5;
   byte control1;
   byte control2;
@@ -160,16 +180,12 @@ typedef struct StatusRxCmd {
   byte brightness;
 };
 
-typedef struct AckRxCmd {
+struct AckRxCmd {
   byte version = 5;
   byte control1;
   byte control2;
   byte end;
 };
-
-int applyGammaCorrection(int r, double t) {
-  return (int)(255 * pow((double)r / 255, t));
-}
 
 #define IMPLEMENTATION FIFO
 
@@ -184,6 +200,14 @@ cppQueue rx(
     sizeof(Packet), NB_ITEMS, IMPLEMENTATION, false, r_dat,
     sizeof(r_dat));
 
+// The rx queue is written from the NimBLE host task (onBLENotify runs in its
+// GAP event handler) and drained from the Arduino loop task, and cppQueue has
+// no internal locking - unguarded, the two tasks race on the queue's count/
+// index fields and can corrupt it (stuck-full queue, phantom packets). Guard
+// every rx access with this spinlock; the critical sections are only a 19-byte
+// memcpy, so the lock hold time is negligible.
+portMUX_TYPE rxMux = portMUX_INITIALIZER_UNLOCKED;
+
 Packet createPacket(uint8_t header, const uint8_t* data, size_t dataSize) {
   Packet packet;
   packet.header = header;
@@ -192,73 +216,31 @@ Packet createPacket(uint8_t header, const uint8_t* data, size_t dataSize) {
   return packet;
 }
 
-void turnFanOn() {
+// Build one 19-byte command frame and queue it for the BLE writer in loop().
+// All twelve fan/light commands share this one frame layout; only the type
+// byte and (for some commands) dimmer/RGB/speed differ. Protocol rules from
+// README.md are enforced here in one place: version stays CODE_VERSION (0x01),
+// control bytes stay 00/40, and speed stays 0 for everything except the
+// color-save command (0x0D), which is the only caller that passes speed=30.
+void queueCommand(byte type, byte dimmer = 0, byte r = 0, byte g = 0,
+                  byte b = 0, byte speed = 0) {
   TxCmd cmd;
-  cmd.type = CODE_TURN_FAN_ON;
-  Packet packet = createPacket(58, (const uint8_t*)&cmd, 17);
-  tx.push(&packet);
-}
-
-void activateFavColor(byte brightness) {
-  TxCmd cmd1;
-  cmd1.type = CODE_ACTIVATE_FAVORITE_COLOR1;
-  cmd1.dimmer = brightness;
-  Packet packet = createPacket(58, (const uint8_t*)&cmd1, 17);
-  tx.push(&packet);
-}
-
-void setRGB(byte r, byte g, byte b) {
-  TxCmd cmd0;
-  cmd0.type = CODE_SAVE_FAVORITE_COLOR1;
-  cmd0.r = r;
-  cmd0.g = g;
-  cmd0.b = b;
-  cmd0.speed = 30;
-  Packet packet = createPacket(58, (const uint8_t*)&cmd0, 17);
-  tx.push(&packet);
-}
-
-void deactivateFavColor() {
-  TxCmd cmd1;
-  cmd1.type = CODE_DEACTIVATE_FAVORITE_COLOR1;
-  Packet packet = createPacket(58, (const uint8_t*)&cmd1, 17);
-  tx.push(&packet);
-}
-
-void turnOnWallRGB() {
-  TxCmd cmd1;
-  cmd1.type = CODE_TURN_ON_RGB;
-  Packet packet = createPacket(58, (const uint8_t*)&cmd1, 17);
-  tx.push(&packet);
-}
-
-void turnOffWallRGB() {
-  TxCmd cmd1;
-  cmd1.type = CODE_TURN_OFF_RGB;
-  Packet packet = createPacket(58, (const uint8_t*)&cmd1, 17);
-  tx.push(&packet);
-}
-
-void turnFanOff() {
-  TxCmd cmd;
-  cmd.type = CODE_TURN_FAN_OFF;
-  Packet packet = createPacket(58, (const uint8_t*)&cmd, 17);
-  tx.push(&packet);
-}
-
-void turnWhiteLightOn(byte brightness) {
-  TxCmd cmd;
-  cmd.type = CODE_TURN_LIGHT_ON;  // 3 - bright white light, dimmer = brightness
-  cmd.dimmer = brightness;
-  Packet packet = createPacket(58, (const uint8_t*)&cmd, 17);
-  tx.push(&packet);
-}
-
-void turnWhiteLightOff() {
-  TxCmd cmd;
-  cmd.type = CODE_TURN_LIGHT_OFF;  // 4
-  Packet packet = createPacket(58, (const uint8_t*)&cmd, 17);
-  tx.push(&packet);
+  cmd.type = type;
+  cmd.dimmer = dimmer;
+  cmd.r = r;
+  cmd.g = g;
+  cmd.b = b;
+  cmd.speed = speed;
+  Packet packet = createPacket(CODE_CMD_START, (const uint8_t*)&cmd,
+                               CODE_CMD_LENGTH);
+  // The queue drops the newest item when full (overwrite=false). That only
+  // happens when BLE has been down long enough for 25 commands to pile up;
+  // surface it instead of losing the command silently.
+  if (!tx.push(&packet)) {
+    DBG_PRINTLN("TX queue full, command dropped");
+    panics += 1;
+    errorSensor.setValue(panics);
+  }
 }
 
 int fromHABrightness(uint8_t b) {
@@ -278,11 +260,7 @@ void onSwitchCommandFan(bool state, HASwitch* sender) {
     return;
   }
 
-  if (state) {
-    turnFanOn();
-  } else {
-    turnFanOff();
-  }
+  queueCommand(state ? CODE_TURN_FAN_ON : CODE_TURN_FAN_OFF);
   sender->setState(state);
 }
 
@@ -291,12 +269,7 @@ void onSwitchCommandWallRgb(bool state, HASwitch* sender) {
     return;
   }
 
-  if (state) {
-    turnOnWallRGB();
-  } else {
-    turnOffWallRGB();
-  }
-
+  queueCommand(state ? CODE_TURN_ON_RGB : CODE_TURN_OFF_RGB);
   sender->setState(state);
 }
 
@@ -306,9 +279,10 @@ void onStateCommand(bool state, HALight* sender) {
   }
 
   if (state) {
-    activateFavColor(fromHABrightness(sender->getCurrentBrightness()));
+    queueCommand(CODE_ACTIVATE_FAVORITE_COLOR1,
+                 fromHABrightness(sender->getCurrentBrightness()));
   } else {
-    deactivateFavColor();
+    queueCommand(CODE_DEACTIVATE_FAVORITE_COLOR1);
   }
   sender->setState(state);
 }
@@ -317,14 +291,16 @@ void onBrightnessCommand(uint8_t brightness, HALight* sender) {
   if ((int)brightness == (int)sender->getCurrentBrightness()) {
     return;
   }
-  activateFavColor(fromHABrightness(brightness));
+  queueCommand(CODE_ACTIVATE_FAVORITE_COLOR1, fromHABrightness(brightness));
   sender->setBrightness(brightness);
 }
 
 void onRGBColorCommand(HALight::RGBColor color, HALight* sender) {
   // The official app sends raw 0-255 RGB to the fan with NO gamma correction
   // (confirmed by BLE capture: e.g. orange -> 0d ff a5 04). Send values as-is.
-  setRGB(color.red, color.green, color.blue);
+  // Color-save (0x0D) is the ONE command that uses a non-zero speed byte (30).
+  queueCommand(CODE_SAVE_FAVORITE_COLOR1, 0, color.red, color.green,
+               color.blue, 30);
 
   sender->setRGBColor(color);
 }
@@ -335,9 +311,10 @@ void onWhiteStateCommand(bool state, HALight* sender) {
   }
 
   if (state) {
-    turnWhiteLightOn(fromHABrightness(sender->getCurrentBrightness()));
+    queueCommand(CODE_TURN_LIGHT_ON,
+                 fromHABrightness(sender->getCurrentBrightness()));
   } else {
-    turnWhiteLightOff();
+    queueCommand(CODE_TURN_LIGHT_OFF);
   }
   sender->setState(state);
 }
@@ -346,11 +323,12 @@ void onWhiteBrightnessCommand(uint8_t brightness, HALight* sender) {
   if ((int)brightness == (int)sender->getCurrentBrightness()) {
     return;
   }
-  turnWhiteLightOn(fromHABrightness(brightness));
+  queueCommand(CODE_TURN_LIGHT_ON, fromHABrightness(brightness));
   sender->setBrightness(brightness);
 }
 
 void printPacket(Packet packet) {
+#if CC_DEBUG
   Serial.printf("Packet (len=%d, header=%d): ", packet.len, packet.header);
   Serial.printf("0x%02X ", packet.header);
   Serial.printf("0x%02X ", packet.len);
@@ -359,6 +337,7 @@ void printPacket(Packet packet) {
     Serial.printf("0x%02X ", packet.data[i]);
   }
   Serial.print("\r\n");
+#endif
 }
 
 void onBLENotify(NimBLERemoteCharacteristic* pBLERemoteCharacteristic,
@@ -368,22 +347,34 @@ void onBLENotify(NimBLERemoteCharacteristic* pBLERemoteCharacteristic,
   }
 
   if (pData[0] != 58) {
-    Serial.printf("Got invalid packet: %d, %d\r\n", length, pData[1]);
+    DBG_PRINTF("Got invalid packet: %d, %d\r\n", length, pData[1]);
     return;
   }
 
-  Packet packet = createPacket(pData[0], pData + 2, pData[1]);
+  // The wire length byte is attacker/corruption-controlled; clamp it before
+  // createPacket() memcpys it into Packet.data[17] (a bad byte here would
+  // otherwise smash the NimBLE host task stack) and never read past the
+  // actual notification payload.
+  uint8_t dataLen = pData[1];
+  if (dataLen > CODE_CMD_LENGTH || (size_t)dataLen + 2 > length) {
+    DBG_PRINTF("Got oversized packet: %d, %d\r\n", length, dataLen);
+    return;
+  }
+
+  Packet packet = createPacket(pData[0], pData + 2, dataLen);
+  portENTER_CRITICAL(&rxMux);
   rx.push(&packet);
+  portEXIT_CRITICAL(&rxMux);
 }
 
 class BLEClientCallback : public NimBLEClientCallbacks {
   void onConnect(NimBLEClient* pclient) {
-    Serial.println("BLE Connected");
+    DBG_PRINTLN("BLE Connected");
     bleConnected = true;
   }
 
   void onDisconnect(NimBLEClient* pclient, int reason) {
-    Serial.printf("BLE Disconnected (reason %d)\r\n", reason);
+    DBG_PRINTF("BLE Disconnected (reason %d)\r\n", reason);
     bleConnected = false;
   }
 };
@@ -393,7 +384,7 @@ class BLEClientCallback : public NimBLEClientCallbacks {
 // each retry exhausts the pool and the next createClient() returns nullptr,
 // which then crashes (LoadProhibited) on the first method call.
 bool bleFail(const char* msg) {
-  Serial.println(msg);
+  DBG_PRINTLN(msg);
   if (pClient != nullptr) {
     NimBLEDevice::deleteClient(pClient);
     pClient = nullptr;
@@ -404,10 +395,10 @@ bool bleFail(const char* msg) {
 }
 
 bool connectToBLE() {
-  Serial.print("Forming a connection to ");
+  DBG_PRINT("Forming a connection to ");
 
   NimBLEAddress bleAddress(address, BLE_ADDR_PUBLIC);
-  Serial.println(bleAddress.toString().c_str());
+  DBG_PRINTLN(bleAddress.toString().c_str());
 
   pWriteChar = nullptr;
   pNotifyChar = nullptr;
@@ -435,7 +426,7 @@ bool connectToBLE() {
     return bleFail("Failed to connect to BLE device");
   }
 
-  Serial.println("Connected to BLE Device");
+  DBG_PRINTLN("Connected to BLE Device");
 
   NimBLEUUID writeUuid(WRITE_CHARACTERISTIC_UUID);
   NimBLEUUID notifyUuid(NOTIFY_CHARACTERISTIC_UUID);
@@ -459,24 +450,40 @@ bool connectToBLE() {
   if (pWriteChar == nullptr) {
     return bleFail("Failed to find the command characteristic");
   }
-  Serial.printf("Found command characteristic (handle 0x%04x)\r\n",
-                pWriteChar->getHandle());
+  DBG_PRINTF("Found command characteristic (handle 0x%04x)\r\n",
+             pWriteChar->getHandle());
 
   if (pNotifyChar == nullptr) {
     return bleFail("Failed to find the status (notify) characteristic");
   }
-  Serial.printf("Found status characteristic (handle 0x%04x)\r\n",
-                pNotifyChar->getHandle());
+  DBG_PRINTF("Found status characteristic (handle 0x%04x)\r\n",
+             pNotifyChar->getHandle());
 
   // Subscribe for notifications. NimBLE writes the CCCD (0x2902) for us, which
   // is also what makes the fan start processing commands. true = notifications.
   if (!pNotifyChar->subscribe(true, onBLENotify)) {
     return bleFail("Failed to subscribe to status notifications");
   }
-  Serial.println("Subscribed to status notifications");
+  DBG_PRINTLN("Subscribed to status notifications");
 
   bleConnected = true;
   return true;
+}
+
+// Persist why we're about to restart to NVS (flash) so it survives the reboot.
+// Without this, a hang that only the watchdog/self-heal can see leaves no
+// trace once the chip comes back up - you're left guessing from RSSI/heap
+// snapshots that no longer reflect the state that actually caused the restart.
+void saveCrashInfo(const char* reason) {
+  crashPrefs.begin("chromacomfort", false);  // read-write
+  crashPrefs.putString("reason", reason);
+  crashPrefs.putULong("uptime_s", millis() / 1000);
+  crashPrefs.putInt("rssi", WiFi.RSSI());
+  crashPrefs.putUInt("heap", ESP.getFreeHeap());
+  crashPrefs.putBool("wifi_ok", WiFi.status() == WL_CONNECTED);
+  crashPrefs.putBool("mqtt_ok", mqtt.isConnected());
+  crashPrefs.putBool("ble_ok", bleConnected);
+  crashPrefs.end();
 }
 
 // Restart with a clean network teardown. A bare ESP.restart() abandons the
@@ -486,7 +493,8 @@ bool connectToBLE() {
 // clean MQTT disconnect + WiFi/radio off makes a software restart behave like a
 // power cycle for the broker.
 void cleanRestart(const char* reason) {
-  Serial.printf("Restarting: %s\r\n", reason);
+  DBG_PRINTF("Restarting: %s\r\n", reason);
+  saveCrashInfo(reason);
   mqtt.disconnect();
   delay(150);
   WiFi.disconnect(true);
@@ -496,6 +504,35 @@ void cleanRestart(const char* reason) {
 
 void onRebootButtonCommand(HAButton* sender) {
   cleanRestart("Home Assistant reboot button");
+}
+
+// ArduinoOTA callbacks. onProgress fires repeatedly while a firmware image is
+// being received; ArduinoOTA.handle() blocks loop() for the whole transfer, so
+// pet the hardware watchdog here or a slow WiFi upload can panic-reboot mid-
+// flash and corrupt the OTA partition.
+void onOTAStart() {
+  DBG_PRINTF("OTA update starting (%s)...\r\n",
+             (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem");
+  saveCrashInfo("OTA update in progress");
+}
+
+void onOTAEnd() {
+  DBG_PRINTLN("OTA update complete, rebooting...");
+}
+
+void onOTAProgress(unsigned int progress, unsigned int total) {
+  esp_task_wdt_reset();
+#if CC_DEBUG
+  static unsigned long lastLog = 0;
+  if (millis() - lastLog > 1000) {
+    lastLog = millis();
+    Serial.printf("OTA progress: %u%%\r\n", (progress * 100) / total);
+  }
+#endif
+}
+
+void onOTAError(ota_error_t error) {
+  DBG_PRINTF("OTA error [%u]\r\n", (unsigned)error);
 }
 
 // Reboot if WiFi / MQTT / BLE stays down past its threshold. Each subsystem's
@@ -513,15 +550,6 @@ void selfHeal() {
     cleanRestart("scheduled 24h proactive reboot");
   }
 
-  // Proactively refresh MQTT to clear half-open connections before they turn
-  // into a stale-HA outage. Clean disconnect; mqtt.loop() reconnects next iter
-  // (which also republishes discovery + current state to HA).
-  if (mqtt.isConnected() && now - lastMqttRefreshAt > MQTT_REFRESH_MS) {
-    lastMqttRefreshAt = now;
-    Serial.println("Proactive MQTT reconnect (clearing any half-open state)");
-    mqtt.disconnect();
-  }
-
   const char* reason = nullptr;
   if (now - lastWifiOkAt > WIFI_DOWN_REBOOT_MS) reason = "WiFi down too long";
   else if (now - lastMqttOkAt > MQTT_DOWN_REBOOT_MS) reason = "MQTT down too long";
@@ -534,20 +562,58 @@ void selfHeal() {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("Starting...");
+  DBG_PRINTLN("Starting...");
+
+  // Read back why the previous boot restarted, before anything else touches
+  // NVS. The saved reason is ONE-SHOT: it's removed after being read, because
+  // hard resets (task-WDT panic, brownout, power cycle) never call
+  // saveCrashInfo, and without the removal they'd replay a stale reason from
+  // an older soft restart - actively misleading during exactly the kind of
+  // debugging this sensor exists for. When there's no saved reason, report the
+  // silicon's own reset cause instead (esp_reset_reason: 1=poweron 3=sw
+  // 4=panic 5=int-wdt 6=task-wdt 9=brownout).
+  crashPrefs.begin("chromacomfort", false);  // read-write (to clear the reason)
+  if (crashPrefs.isKey("reason")) {
+    lastRestartInfo = crashPrefs.getString("reason", "unknown") + " (uptime=" +
+        String(crashPrefs.getULong("uptime_s", 0)) + "s rssi=" +
+        String(crashPrefs.getInt("rssi", 0)) + "dBm heap=" +
+        String(crashPrefs.getUInt("heap", 0)) + " wifi=" +
+        String(crashPrefs.getBool("wifi_ok", false)) + " mqtt=" +
+        String(crashPrefs.getBool("mqtt_ok", false)) + " ble=" +
+        String(crashPrefs.getBool("ble_ok", false)) + ")";
+    crashPrefs.remove("reason");
+    DBG_PRINTF("[boot] previous restart: %s\r\n", lastRestartInfo.c_str());
+  } else {
+    lastRestartInfo =
+        "unlogged reset (esp_reset_reason=" + String((int)esp_reset_reason()) + ")";
+  }
+  crashPrefs.end();
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   unsigned long wifiStart = millis();
   while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
+    DBG_PRINT(".");
     delay(500);
     if (millis() - wifiStart > WIFI_DOWN_REBOOT_MS) {
-      Serial.println("\nWiFi connect timed out; restarting...");
+      DBG_PRINTLN("\nWiFi connect timed out; restarting...");
+      saveCrashInfo("WiFi connect timeout at boot");
       ESP.restart();
     }
   }
-  Serial.println();
-  Serial.println("Connected to the network");
+  DBG_PRINTLN();
+  DBG_PRINTLN("Connected to the network");
+
+  // Wireless firmware updates. Password-protected since this opens a network
+  // port that accepts firmware pushes. ArduinoOTA.handle() in loop() blocks for
+  // the whole transfer, so pet the hardware watchdog from onOTAProgress.
+  ArduinoOTA.setHostname("chromacomfort-bridge");
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.onStart(onOTAStart);
+  ArduinoOTA.onEnd(onOTAEnd);
+  ArduinoOTA.onProgress(onOTAProgress);
+  ArduinoOTA.onError(onOTAError);
+  ArduinoOTA.begin();
+  DBG_PRINTLN("OTA ready");
 
   // Set the HA unique id / MQTT client id from the MAC. This MUST be read AFTER
   // WiFi is initialized - reading it before WiFi.begin() returns uninitialized
@@ -558,11 +624,20 @@ void setup() {
   byte mac[6];
   WiFi.macAddress(mac);
   device.setUniqueId(mac, sizeof(mac));
-  Serial.printf("Device unique id (MAC): %02X:%02X:%02X:%02X:%02X:%02X\r\n",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  // Namespace every entity's unique_id with this device's own MAC-based id
+  // (e.g. "04b247842310_fan" instead of a bare "fan"). Without this, any other
+  // device - past, present, or a bug reintroducing the old garbage-MAC issue -
+  // that ever published discovery under the same bare object_ids can silently
+  // shadow this device's entities in Home Assistant, exactly like the stale
+  // v1.3.0 ghost identity (0000d3120f80) did to the fan/light/uptime/etc.
+  // entities in July 2026. Extended IDs make that class of collision structurally
+  // impossible instead of something that has to be manually cleaned up.
+  device.enableExtendedUniqueIds();
+  DBG_PRINTF("Device unique id (MAC): %02X:%02X:%02X:%02X:%02X:%02X\r\n",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
   device.setName("ChromaComfort BT to MQTT Bridge");
-  device.setSoftwareVersion("1.4.4");  // MQTT buffer 2KB (1KB still too small for RGB light discovery)
+  device.setSoftwareVersion("1.5.1");  // ack fix, rx locking, flash diet
 
   fan.onCommand(onSwitchCommandFan);
   fan.setName("Fan");
@@ -590,6 +665,12 @@ void setup() {
   rxSensor.setName("RX");
   acksSensor.setIcon("mdi:call-received");
   acksSensor.setName("Acks");
+  rssiSensor.setIcon("mdi:wifi");
+  rssiSensor.setName("WiFi RSSI");
+  rssiSensor.setUnitOfMeasurement("dBm");
+  lastRestartSensor.setIcon("mdi:history");
+  lastRestartSensor.setName("Last Restart Reason");
+  lastRestartSensor.setValue(lastRestartInfo.c_str());
 
   rebootButton.setName("Reboot Bridge");
   rebootButton.setIcon("mdi:restart");
@@ -608,7 +689,7 @@ void setup() {
   mqtt.setBufferSize(2048);
 
   mqtt.begin(BROKER_ADDR, MQTT_USER, MQTT_PASS);
-  Serial.println("Connected to mqtt");
+  DBG_PRINTLN("Connected to mqtt");
 
   // Pump the MQTT client for a few seconds so it fully connects AND flushes its
   // Home Assistant discovery (config) messages on a fresh, healthy connection -
@@ -619,8 +700,8 @@ void setup() {
     mqtt.loop();
     delay(100);
   }
-  Serial.printf("MQTT settled (connected=%d), discovery flushed\r\n",
-                mqtt.isConnected());
+  DBG_PRINTF("MQTT settled (connected=%d), discovery flushed\r\n",
+             mqtt.isConnected());
 
   NimBLEDevice::init("");
 
@@ -628,11 +709,11 @@ void setup() {
   // retries on a timer, so MQTT / Home Assistant come up immediately even when
   // the fan is unreachable at boot (the bridge just shows its entities and
   // (re)connects to the fan in the background).
-  Serial.println("Attempting initial BLE connection (non-blocking)...");
+  DBG_PRINTLN("Attempting initial BLE connection (non-blocking)...");
   connectToBLE();
 
   // Start the self-heal grace windows now so we don't reboot immediately at boot.
-  lastWifiOkAt = lastMqttOkAt = lastBleOkAt = lastMqttRefreshAt = millis();
+  lastWifiOkAt = lastMqttOkAt = lastBleOkAt = millis();
 
   // Hardware Task Watchdog (last-resort backstop). If loop() ever stops running
   // entirely - a total freeze the software self-heal can't catch, because the
@@ -648,14 +729,20 @@ void setup() {
     esp_task_wdt_reconfigure(&wdtConfig);
   }
   esp_task_wdt_add(NULL);
-  Serial.printf("Hardware watchdog armed (%lu ms)\r\n", (unsigned long)WDT_TIMEOUT_MS);
+  DBG_PRINTF("Hardware watchdog armed (%lu ms)\r\n", (unsigned long)WDT_TIMEOUT_MS);
 }
 
 int heartbeats_since_ack = 0;
+// True from the moment a command's 3x write burst goes out until the first
+// ack frame for it comes back. The fan can ack each of the three writes, so
+// counting raw A0 40 frames would overcount; this counts acked COMMANDS,
+// keeping the Acks sensor comparable to TX.
+bool awaitingAck = false;
 bool firstRun = true;
 
 void loop() {
   esp_task_wdt_reset();  // pet the hardware watchdog every iteration
+  ArduinoOTA.handle();
   mqtt.loop();
   selfHeal();
 
@@ -665,6 +752,7 @@ void loop() {
     txSensor.setValue((int32_t)0);
     errorSensor.setValue((int32_t)0);
     uptimeSensor.setValue((int32_t)0);
+    rssiSensor.setValue((int32_t)WiFi.RSSI());
     firstRun = false;
   }
 
@@ -674,6 +762,7 @@ void loop() {
   if ((millis() - lastUpdateAt) > 2000) {
     unsigned long uptimeValue = millis() / 1000;
     uptimeSensor.setValue((int32_t)uptimeValue);
+    rssiSensor.setValue((int32_t)WiFi.RSSI());
     heartbeats += 1;
     if (tx.getCount() > 0) {
       heartbeats_since_ack += 1;
@@ -681,6 +770,7 @@ void loop() {
     lastUpdateAt = millis();
     rxSensor.setValue(rxs);
 
+#if CC_DEBUG
     // Periodic diagnostic heartbeat (every ~10s) so the serial always shows the
     // identity + connection state regardless of BLE traffic.
     static unsigned long lastDiag = 0;
@@ -695,6 +785,7 @@ void loop() {
           m[3], m[4], m[5], (int)WiFi.RSSI(), WiFi.status() == WL_CONNECTED,
           mqtt.isConnected(), bleConnected, (unsigned)ESP.getFreeHeap());
     }
+#endif
   }
 
   if (!bleConnected) {
@@ -704,20 +795,20 @@ void loop() {
     // long. Skip the TX/RX handling until BLE is back.
     if (millis() - lastBleAttemptAt > 5000) {
       lastBleAttemptAt = millis();
-      Serial.println("BLE not connected, attempting reconnect...");
+      DBG_PRINTLN("BLE not connected, attempting reconnect...");
       connectToBLE();
     }
     return;
   }
 
   if (tx.getCount() > 0) {
-    Serial.printf("It's been %d heartbeats since last ack",
-                  heartbeats_since_ack);
+    DBG_PRINTF("It's been %d heartbeats since last ack\r\n",
+               heartbeats_since_ack);
 
     Packet packet;
     tx.peek(&packet);
 
-    Serial.println("About to send packet: ");
+    DBG_PRINTLN("About to send packet: ");
     printPacket(packet);
 
     if (pWriteChar != nullptr) {
@@ -730,24 +821,38 @@ void loop() {
       tx.pop(&packet);
       txs += 1;
       txSensor.setValue(txs);
+      awaitingAck = true;
     } else {
-      Serial.println("Write characteristic not available");
+      DBG_PRINTLN("Write characteristic not available");
     }
   }
 
+  Packet packet;
+  bool gotRx = false;
+  portENTER_CRITICAL(&rxMux);
   if (rx.getCount() > 0) {
+    rx.pop(&packet);
+    gotRx = true;
+  }
+  portEXIT_CRITICAL(&rxMux);
+
+  if (gotRx) {
     rxs += 1;
 
-    Packet packet;
-    rx.pop(&packet);
-
-    if (packet.len == 4 && tx.getCount() > 0) {
+    // Ack frames are 4 data bytes with control bytes A0 40 (see README). The
+    // send path above pops the command from tx as soon as its 3x write burst
+    // is out, so ack matching must NOT be gated on tx still being non-empty -
+    // that gate is why the Acks sensor sat at 0 while commands visibly worked
+    // (and, when a second command WAS queued, it silently popped/dropped it).
+    if (packet.len == 4) {
       AckRxCmd* ack = (AckRxCmd*)(packet.data);
 
       if (ack->control1 == 160 && ack->control2 == 64) {
-        acks += 1;
-        acksSensor.setValue(acks);
-        tx.pop(&packet);
+        if (awaitingAck) {
+          awaitingAck = false;
+          acks += 1;
+          acksSensor.setValue(acks);
+        }
         heartbeats_since_ack = 0;
       }
     }
@@ -760,13 +865,10 @@ void loop() {
         bool isFanOn = ((s >> 7) & 1) == 1;
         bool isLightOn = ((s >> 6) & 1) == 1;
         bool rgbButton = ((s >> 5) & 1) == 1;
-        bool rgbSweep = ((s >> 4) & 1) == 1;
         bool isFavoriteColor1Active = ((s >> 3) & 1) == 1;
-        bool isFavoriteColor2Active = ((s >> 2) & 1) == 1;
-        bool userPattern = ((s >> 1) & 1) == 1;
-        bool reservedBit = ((s >> 0) & 1) == 1;
         int brightness = status->brightness;
 
+#if CC_DEBUG
         // The fan re-sends identical status many times per second; only log it
         // when something actually changes, so the serial stays readable.
         static int lastStatusKey = -1;
@@ -777,10 +879,13 @@ void loop() {
               "Status: fan=%d white=%d color=%d wallRGB=%d bright=%d\r\n",
               isFanOn, isLightOn, isFavoriteColor1Active, rgbButton, brightness);
         }
+#endif
 
         // The three light modes are mutually exclusive on the fan, so map each
         // status bit to its own entity. The single brightness byte belongs to
-        // whichever mode is currently active.
+        // whichever mode is currently active. (Bits 4/2/1/0 - RGB sweep,
+        // favorite color 2, user pattern, reserved - are decoded in README.md
+        // but unused here.)
         fan.setState(isFanOn);
         whiteLight.setState(isLightOn);              // bit 6 - bright white
         light.setState(isFavoriteColor1Active);      // bit 3 - RGB color
@@ -796,9 +901,10 @@ void loop() {
   }
 
   if (heartbeats_since_ack > 2) {
-    Serial.println("Flushing the queue from panic");
+    DBG_PRINTLN("Flushing the queue from panic");
     tx.flush();
     heartbeats_since_ack = 0;
+    awaitingAck = false;
     panics += 1;
     errorSensor.setValue(panics);
   }

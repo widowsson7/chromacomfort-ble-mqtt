@@ -22,4 +22,9 @@
 #define MQTT_USER "your-mqtt-username"
 #define MQTT_PASS "your-mqtt-password"
 
+// OTA (wireless firmware update) password. Required before ArduinoOTA will
+// accept an upload - set from the Arduino IDE's Tools > Port when this device
+// shows up as a network port, or via `arduino-cli upload --port ... --ota-password`.
+#define OTA_PASSWORD "your-ota-password"
+
 #endif  // CONFIG_H
